@@ -1,0 +1,26 @@
+[project]
+name = "rag"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12.6"
+dependencies = [
+    "beautifulsoup4>=4.14.3",
+    "deepeval>=3.8.4",
+    "faiss-cpu>=1.13.2",
+    "fastapi>=0.128.1",
+    "fastmcp>=2.14.5",
+    "langchain>=1.2.8",
+    "langchain-classic>=1.0.1",
+    "langchain-community>=0.4.1",
+    "langchain-openai>=1.1.7",
+    "langchain-text-splitters>=1.1.0",
+    "matplotlib>=3.10.8",
+    "openai-agents>=0.8.0",
+    "pandas>=3.0.0",
+    "pymupdf>=1.26.7",
+    "pypdf>=6.6.2",
+    "python-dotenv>=1.2.1",
+    "rank-bm25>=0.2.2",
+    "seaborn>=0.13.2",
+]
