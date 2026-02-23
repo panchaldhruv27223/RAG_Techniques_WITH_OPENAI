@@ -81,6 +81,110 @@ def read_pdf_with_metadata(file_path:str) -> List[Document]:
     docs.close()
     return documents
 
+
+### helper function for csv
+def read_csv_as_documents(
+    file_path:str,
+    text_columns:Optional[List[str]]= None,
+    metadata_columns:Optional[List[str]]= None
+) -> List[Document]:
+
+    """
+    Convert a CSV file into Document objects for RAG indexing.
+    
+    Each row becomes one Document with structured "Column: Value" content,
+    making it ideal for semantic search over tabular data.
+    
+    Args:
+        file_path: Path to the CSV file
+        text_columns: Columns to include in searchable content (default: all)
+        metadata_columns: Extra columns to store in metadata (default: all)
+    
+    Returns:
+        List of Document objects ready for embedding
+    """
+    df = pd.read_csv(file_path)
+    columns = text_columns or df.columns.tolist()
+    meta_cols =  metadata_columns or df.columns.tolist() 
+    
+    documents = []
+    for idx, row in df.iterrows():
+        text_parts = [
+            f"{col}: {row[col]}"
+            for col in columns
+            if pd.notna(row[col])
+        ]
+
+        content = "\n".join(text_parts)
+
+        metadata = {
+            "row_index": idx,
+            "source":file_path
+        }
+
+        for col in meta_cols:
+            if pd.notna(row[col]):
+                metadata[col] = str(row[col])
+
+        documents.append(Document(content=content, metadata=metadata))
+
+    return documents
+
+def read_csv_grouped(
+    file_path:str,
+    group_by:str,
+    text_columns: Optional[List[str]] = None
+) -> List[Document]:
+
+    """
+    Group CSV rows by a column and create one Document per group.
+    
+    Useful when multiple rows relate to the same entity (e.g., orders per customer).
+    
+    Args:
+        file_path: Path to the CSV file
+        group_by: Column name to group rows by
+        text_columns: Columns to include in content (default: all)
+    
+    Returns:
+        List of Document objects (one per group)
+    """
+
+    df = pd.read_csv(file_path)
+    columns = text_columns or [c for c in df.columns if c!= group_by]
+
+    documents = []
+
+    for group_key, group_df in df.groupby(group_by):
+
+        text_parts = [f"{group_by}: {group_key}\n"]
+
+        for _, row in group_df.iterrows():
+            row_text = " | ".join(
+                f"{col}: {row[col]}"
+                for col in columns
+                if pd.notna(row[col])
+            )
+
+            text_parts.append(row_text)
+
+        content = "\n".join(text_parts)
+
+        documents.append(
+            Document(
+                content = content,
+                metadata = {
+                    "group_key": str(group_key),
+                    "group_by":group_by,
+                    "row_count":len(group_df),
+                    "source":file_path
+                }
+            )
+        )
+
+    
+    return documents
+
 ## text chunking
 def count_tokens(text: str, model: str = "gpt-4o-mini") -> int:
     """
@@ -353,6 +457,8 @@ class FAISSVectorStore:
             self.documents.append(doc)
 
         ## normalize for cosine similarity 
+        # print(f"Embeddings type: {type(embeddings)}")
+        # print(f"Length of embeddings: {len(embeddings)}")
         vectors = np.array(embeddings, dtype=np.float32)
         faiss.normalize_L2(vectors)
         self.index.add(vectors)
@@ -497,6 +603,25 @@ class RAGRetriever:
 
         return len(chunked)
 
+    def index_csv(
+        self,
+        file_path:str,
+        text_columns: Optional[List[str]] = None
+    ) -> int:
+        """
+        Index CSV File.
+
+        Args:
+            file_path: Path to CSV file
+            text_columns: Columns to include in searchable content
+        
+        Returns:
+            Number of documents indexed
+        """
+        documents = read_csv_as_documents(file_path=file_path, text_columns=text_columns)
+        self.index_documents(documents=documents)
+        return len(documents)
+
     
     def retrieve(self, query:str, k=5) -> List[RetrievalResult]:
         """
@@ -537,7 +662,7 @@ class OpenAIChat:
     """
     OpenAI chat completion wrapper.
     """
-    def __init__(self, model_name: str = "gpt-4o", temperature: float = 0.7, max_tokens: int = 1000, api_key: Optional[str] = None):
+    def __init__(self, model_name: str = "gpt-4o", temperature: float = 0.7, max_tokens: int = 16384, api_key: Optional[str] = None):
         """
         Initialize chat client.
         
@@ -631,6 +756,9 @@ class OpenAIChat:
         """
         json_instruction = "\nRespond with valid JSON only. No markdown, no explanation."
 
+        if schema:
+            json_instruction += f"\nReturn JSON matching schema: {json.dumps(schema)}"
+
         if messages and messages[0]["role"] == "system":
             messages[0]["content"] += json_instruction
         else:
@@ -647,9 +775,8 @@ class OpenAIChat:
         return json.loads(response.choices[0].message.content)
 
 
+
 ## Complete RAG Pipeline
-
-
 class SimpleRAG:
     """
     Complete RAG pipeline using pure OpenAI SDK.
@@ -781,109 +908,3 @@ def cosine_similarity(a:List[float], b:List[float])->float:
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
 
-### helper function for csv
-import pandas as pd 
-import numpy as np 
-from typing import List, Dict, Any, Optional
-
-def read_csv_as_documents(
-    file_path:str,
-    text_columns:Optional[List[str]]= None,
-    metadata_columns:Optional[List[str]]= None
-) -> List[Document]:
-
-    """
-    Convert a CSV file into Document objects for RAG indexing.
-    
-    Each row becomes one Document with structured "Column: Value" content,
-    making it ideal for semantic search over tabular data.
-    
-    Args:
-        file_path: Path to the CSV file
-        text_columns: Columns to include in searchable content (default: all)
-        metadata_columns: Extra columns to store in metadata (default: all)
-    
-    Returns:
-        List of Document objects ready for embedding
-    """
-    df = pd.read_csv(file_path)
-    columns = text_columns or df.columns.tolist()
-    meta_cols =  metadata_columns or df.columns.tolist() 
-    
-    documents = []
-    for idx, row in df.iterrows():
-        text_parts = [
-            f"{col}: {row[col]}"
-            for col in columns
-            if pd.notna(row[col])
-        ]
-
-        content = "\n".join(text_parts)
-
-        metadata = {
-            "row_index": idx,
-            "source":file_path
-        }
-
-        for col in meta_cols:
-            if pd.notna(row[col]):
-                metadata[col] = str(row[col])
-
-        documents.append(Document(content=content, metadata=metadata))
-
-    return documents
-
-def read_csv_grouped(
-    file_path:str,
-    group_by:str,
-    text_columns: Optional[List[str]] = None
-) -> List[Document]:
-
-    """
-    Group CSV rows by a column and create one Document per group.
-    
-    Useful when multiple rows relate to the same entity (e.g., orders per customer).
-    
-    Args:
-        file_path: Path to the CSV file
-        group_by: Column name to group rows by
-        text_columns: Columns to include in content (default: all)
-    
-    Returns:
-        List of Document objects (one per group)
-    """
-
-    df = pd.read_csv(file_path)
-    columns = text_columns or [c for c in df.columns if c!= group_by]
-
-    documents = []
-
-    for group_key, group_df in df.groupby(group_by):
-
-        text_parts = [f"{group_by}: {group_key}\n"]
-
-        for _, row in group_df.iterrows():
-            row_text = " | ".join(
-                f"{col}: {row[col]}"
-                for col in columns
-                if pd.notna(row[col])
-            )
-
-            text_parts.append(row_text)
-
-        content = "\n".join(text_parts)
-
-        documents.append(
-            Document(
-                content = content,
-                metadata = {
-                    "group_key": str(group_key),
-                    "group_by":group_by,
-                    "row_count":len(group_df),
-                    "source":file_path
-                }
-            )
-        )
-
-    
-    return documents

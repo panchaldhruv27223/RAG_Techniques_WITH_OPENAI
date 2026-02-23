@@ -1,0 +1,76 @@
+{
+    "1":{
+        "question": "What is the definition of a “child” in these rules?",
+        "ground_truth" : "A “child” means any person below the age of eighteen years."
+    },
+    
+    "2":{
+        "question": "What does “online real money game” mean?",
+        "ground_truth" : "It is an online game where a user makes a deposit in cash or kind expecting winnings on that deposit."
+    },
+
+    "3":{
+        "question": "Within what time must an intermediary remove/disable unlawful information after “actual knowledge”?",
+        "ground_truth" : "The intermediary must remove or disable access within thirty-six hours of receipt of such actual knowledge."
+    },
+
+    "4":{
+        "question": "What are the two ways “actual knowledge” can arise (as per Rule 3(1)(d))?",
+        "ground_truth": "(i) Order of a court of competent jurisdiction, or (ii) a reasoned written intimation issued by an authorised officer (as specified)."
+    },
+
+    "5": {
+        "question": "What are the content rating categories for online curated content in the Appendix?",
+        "ground_truth": "U, U/A 7+, U/A 13+, U/A 16+, and A"
+    },
+
+    "6": {
+        "question": "By when must an intermediary acknowledge and resolve a complaint handled by its Grievance Officer (Rule 3(2)(a)(i))?",
+        "ground_truth": "The Grievance Officer must acknowledge within 24 hours and resolve within 15 days from receipt."
+    },
+
+    "7": {
+        "question": "What is the timeline to appeal to the Grievance Appellate Committee, and how quickly should it be resolved?",
+        "ground_truth": "Appeal can be filed within 30 days of receiving communication from the Grievance Officer, and the Committee should endeavour to resolve it within 30 calendar days."
+    },
+
+    "8": {
+        "question": "List the minimum criteria for an entity to apply to be designated as an “online gaming self-regulatory body” (Rule 4A(2)).",
+        "ground_truth": "It must meet criteria including: being a section 8 company, having membership representative of the gaming industry, members promoting games responsibly, a Board with specified categories of individuals (industry, users’ interest, educationist, psychology/mental health, ICT, child rights, public policy nominee), MoA/AoA provisions for functions/conflict-free governance/member accountability/criteria for membership and amendments with Ministry approval, and sufficient capacity including financial capacity."
+    },
+
+    "9": {
+        "question": "Before accepting any deposit for a permissible online real money game, what must the online gaming intermediary do?",
+        "ground_truth": "It must identify the user and verify identity before accepting any deposit; and RBI-regulated customer identification procedures apply mutatis mutandis."
+    },
+
+    "10": {
+        "question": "What is the three-tier structure for ensuring adherence to the Code of Ethics for publishers (Part III)?",
+        "ground_truth": "Level I: Self-regulation by publishers; Level II: Self-regulation by self-regulating bodies; Level III: Oversight mechanism by the Central Government."
+    },
+
+    "11": {
+        "question": "Scenario: A user’s grievance against an intermediary is not resolved in time. What appeal route exists and what are the key timing + process requirements?",
+        "ground_truth": "The user may appeal to the Grievance Appellate Committee if aggrieved by the Grievance Officer decision or if the grievance is not resolved within the specified time; the appeal must be filed within 30 days, should be resolved within 30 calendar days, and the Committee uses an online dispute resolution mechanism end-to-end."
+    },
+
+    "12": {
+        "question": "Under Rule 3(1)(d), if the government wants an intermediary to remove unlawful information without a court order, what must the written intimation include and who can issue it?",
+        "ground_truth": "It must be a reasoned intimation in writing issued by an officer authorised by the Appropriate Government/agency, not below Joint Secretary (or equivalent) (or Director-equivalent if JS not appointed). If issued by police administration, not below Deputy Inspector General of Police (specially authorised). It must clearly specify the legal basis/statutory provision, nature of unlawful act, and the specific URL/identifier/electronic location to be removed/disabled; also intimations must undergo monthly periodic review by an officer not below Secretary rank to ensure necessity/proportionality/consistency."
+    },
+
+    "13": {
+        "question": "What actions can a self-regulating body (Level II) issue after disposing a grievance/appeal, and when can it refer content to the Ministry?",
+        "ground_truth": "It may issue guidance/advisories such as warning/censure/admonishing/reprimand, requiring an apology, requiring a warning card/disclaimer, or (for online curated content) direct reclassification/descriptor/access-control modifications/synopsis edits. If it believes action is needed to delete/modify content to prevent incitement to cognisable offence relating to public order or for reasons in section 69A(1), it may refer such content to the Ministry for Oversight Mechanism action."
+    },
+
+    "14": {
+        "question": "Explain the verification lifecycle of a permissible online real money game under Rule 4A: conditions, temporary period, and publication requirements.",
+        "ground_truth": "A self-regulatory body may declare a game permissible if satisfied (after inquiry) that it does not involve wagering and that the intermediary/game complies with rules 3 and 4, relevant age/contract laws, and the body’s framework. It may initially rely on applicant information and declare it permissible for up to 3 months, during which it should complete inquiry and then either confirm permissible or reject with reasons. The body must publish and maintain an updated list of all permissible online real money games with details including applicant, dates/validity, reasons, and any suspension/revocation details."
+    },
+
+    "15": {
+        "question": "For “A” rated online curated content, what access restrictions and verification mechanisms are required in the Appendix?",
+        "ground_truth": "For content classified as “A”, the publisher must implement a reliable age verification mechanism for viewership, and must take all efforts to restrict access to such “A” content by a child using appropriate access control measures."
+    }
+}
