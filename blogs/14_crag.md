@@ -1,250 +1,356 @@
-# CRAG: Corrective RAG — When Retrieved Documents Aren't Good Enough
-
-> **Technique:** Corrective RAG (CRAG)  
-> **Complexity:** Advanced  
-> **Key Libraries:** `openai`, `faiss-cpu`, `duckduckgo-search`
+# CRAG: Corrective RAG with Intelligent Fallback
 
 ---
 
 ## Introduction
 
-Standard RAG has a silent assumption baked in: *the retrieved documents are relevant*. It retrieves the top-k chunks and feeds them to the LLM, trusting that vector similarity translates to answer quality. But what if the query asks about something your document corpus doesn't cover? What if the user asks about a recent event that post-dates your knowledge base?
+Standard RAG has a fundamental trust problem: it trusts that what it retrieved is relevant. If your vector database returns chunks that happen to score high cosine similarity but don't actually address the query — due to embedding noise, topical adjacency, or corpus coverage gaps — the LLM will receive bad context and produce a bad answer. No alarm is raised. No correction is made. The system confidently answers from wrong evidence.
 
-In these cases, standard RAG doesn't fail loudly — it fails quietly, generating confident-sounding answers from irrelevant context. This is arguably the worst failure mode in production RAG systems.
+**Corrective RAG (CRAG)**, introduced by Shi et al. (2024), addresses this by adding a self-evaluation step between retrieval and generation. Before passing retrieved chunks to the LLM for answer generation, a "corrector" evaluates each chunk's relevance and routes the system through one of three decision paths:
 
-**Corrective RAG (CRAG)** introduces an explicit quality check on retrieved documents and *actively corrects* when local context is insufficient by falling back to web search. It transforms retrieval from a passive step into an informed decision.
+1. **CORRECT**: Retrieved content is highly relevant → proceed directly to generation
+2. **INCORRECT**: Retrieved content is irrelevant → discard it, search the web, generate from web results
+3. **AMBIGUOUS**: Partial relevance → refine the retrieved content AND supplement with web search
+
+This corrective loop transforms RAG from a single-pass pipeline into a quality-aware system that can detect and recover from retrieval failures — the most common cause of RAG hallucinations.
 
 ---
 
 ## The Three-Action Decision Framework
 
-CRAG evaluates retrieved documents using an LLM-based relevance scorer and commits to one of three actions based on the highest relevance score among retrieved documents:
-
 ```
-Retrieved documents: [Doc1, Doc2, Doc3]
-                        ↓
-          [LLM scores each: 0.0 – 1.0]
-                        ↓
-          max_score = max(scores)
-                        ↓
-        ┌───────────────────────────────────┐
-        │ max_score > 0.7                   │
-        │ → CORRECT: Use best local doc     │
-        ├───────────────────────────────────┤
-        │ max_score < 0.3                   │
-        │ → INCORRECT: Discard, use web     │
-        ├───────────────────────────────────┤
-        │ 0.3 ≤ max_score ≤ 0.7           │
-        │ → AMBIGUOUS: Combine both         │
-        └───────────────────────────────────┘
+User Query
+     │
+     ▼
+[Standard Vector Retrieval]
+     │
+     ▼
+[Relevance Evaluation — per retrieved chunk]
+     │
+     ├─── Score > 0.7 (HIGH) ───► CORRECT
+     │                                │
+     │                                ▼
+     │                        Use retrieved docs directly
+     │                        → Generate answer
+     │
+     ├─── Score 0.3-0.7 (MEDIUM) ─► AMBIGUOUS
+     │                                │
+     │                                ▼
+     │                        Strip irrelevant sentences
+     │                        + Web search for supplemental info
+     │                        → Generate from refined + web docs
+     │
+     └─── Score < 0.3 (LOW) ───► INCORRECT
+                                      │
+                                      ▼
+                                Discard retrieved docs entirely
+                                Rewrite query for web search
+                                → Generate from web docs only
 ```
 
-This is the key innovation: retrieval isn't just a passive lookup — it's an evaluated decision with three distinct outcomes.
+The evaluation score is a per-chunk relevance assessment made by the LLM, not the embedding similarity. Embedding similarity is a retrieval signal; CRAG adds a second, independent evaluation using the LLM's semantic understanding.
 
 ---
 
-## Code Deep Dive
-
-### Relevance Evaluation
+## The Relevance Evaluator
 
 ```python
-def _evaluate_relevance(self, query: str, document: str) -> float:
+class RelevanceEvaluator:
+    """
+    Evaluates how relevant a retrieved document chunk is to a given query.
+    Uses the LLM as an 'intelligent judge' — can understand nuance, negation,
+    paraphrase, and domain relevance that cosine similarity cannot.
+    """
+    
+    # Thresholds for the three action categories
+    CORRECT_THRESHOLD = 0.7    # High: directly useful
+    INCORRECT_THRESHOLD = 0.3  # Low: discard and use web
+    # AMBIGUOUS: 0.3 < score ≤ 0.7 (between thresholds)
+    
+    def evaluate(self, query: str, document: str) -> RelevanceResult:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a relevance evaluation expert. Given a query and a "
+                    "document, assess how relevant the document is to answering "
+                    "the query on a scale of 0.0 to 1.0.\n\n"
+                    "Scoring criteria:\n"
+                    "  0.9-1.0: Document directly answers the query completely\n"
+                    "  0.7-0.9: Document substantially addresses the query\n"
+                    "  0.5-0.7: Document is partially relevant, addresses some aspects\n"
+                    "  0.3-0.5: Document is tangentially related but doesn't address the query well\n"
+                    "  0.1-0.3: Document is on a related topic but not relevant to the query\n"
+                    "  0.0-0.1: Document is completely irrelevant\n\n"
+                    'Return JSON: {"score": <float>, "reasoning": "<brief explanation>"}'
+                )
+            },
+            {
+                "role": "user",
+                "content": f"Query: {query}\n\nDocument:\n{document[:2000]}"
+            }
+        ]
+        
+        result = self.llm.chat_json(messages)
+        score = float(result.get("score", 0.5))
+        reasoning = result.get("reasoning", "")
+        
+        # Classify action based on thresholds
+        if score >= self.CORRECT_THRESHOLD:
+            action = "CORRECT"
+        elif score >= self.INCORRECT_THRESHOLD:
+            action = "AMBIGUOUS"
+        else:
+            action = "INCORRECT"
+        
+        return RelevanceResult(score=score, action=action, reasoning=reasoning)
+```
+
+**Why use an LLM evaluator instead of cosine similarity?**
+
+Consider this pair:
+- Query: "What is the GDP of France?"
+- Retrieved chunk: "France has a rich cultural heritage, including world-famous cuisine, art, and architecture. Paris is the capital city and houses the Louvre museum..."
+
+Cosine similarity might be 0.71 (both are about France — semantically related). An LLM evaluator correctly scores this 0.1: "Document discusses French culture but does not mention GDP or economic statistics."
+
+Without CRAG, the LLM would receive this irrelevant chunk and potentially hallucinate a GDP figure. With CRAG, it's flagged as INCORRECT and the system falls back to web search.
+
+---
+
+## The Web Search Fallback
+
+When retrieval is deemed INCORRECT or AMBIGUOUS, CRAG uses web search to cover the gap:
+
+```python
+class WebSearcher:
+    def search(self, query: str, max_results: int = 3) -> List[str]:
+        """
+        Search the web for information not available in the vector store.
+        Uses DuckDuckGo (no API key required) as the default provider.
+        """
+        from duckduckgo_search import DDGS
+        
+        results = []
+        with DDGS() as ddgs:
+            for result in ddgs.text(query, max_results=max_results):
+                # Combine title + body for richer context
+                snippet = f"Source: {result.get('title', 'Unknown')}\n{result.get('body', '')}"
+                results.append(snippet)
+        
+        return results if results else ["No web results found"]
+    
+    def rewrite_query_for_web(self, original_query: str) -> str:
+        """
+        Optimize the query for web search engines.
+        Web search prefers keyword-heavy, specific queries.
+        """
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Rewrite the query for a web search engine. "
+                    "Make it more specific, keyword-focused, and remove "
+                    "conversational elements. Keep it under 10 words if possible."
+                )
+            },
+            {
+                "role": "user",
+                "content": f"Original: {original_query}\n\nWeb-optimized version:"
+            }
+        ]
+        return self.llm.chat(messages).strip()
+```
+
+**Why rewrite the query for web search?**
+
+Natural language queries work well for embedding retrieval but poorly for web search engines. "What is the biological mechanism by which aspirin reduces fever?" → web-optimized: "aspirin antipyretic mechanism COX inhibition fever". The reformulation matches how web documents are indexed — keyword-dense, not conversational.
+
+---
+
+## The Complete CRAG Pipeline
+
+```python
+def query(self, question: str) -> Tuple[str, CRAGResult]:
+    """Execute the corrective RAG pipeline."""
+    
+    # Step 1: Initial vector retrieval
+    results = self.vector_store.search(query_embedding, k=self.k)
+    retrieval_action = "CORRECT"  # optimistic default
+    all_context = []
+    
+    # Step 2: Evaluate each retrieved chunk
+    per_chunk_actions = []
+    for result in results:
+        chunk_text = result.document.content
+        evaluation = self.relevance_evaluator.evaluate(question, chunk_text)
+        
+        per_chunk_actions.append({
+            "chunk": chunk_text[:100],
+            "action": evaluation.action,
+            "score": evaluation.score,
+            "reasoning": evaluation.reasoning
+        })
+        
+        # The overall action is determined by the WORST chunk action
+        # If any chunk is INCORRECT, we must fall back for that chunk
+        if evaluation.action == "AMBIGUOUS" and retrieval_action == "CORRECT":
+            retrieval_action = "AMBIGUOUS"
+        elif evaluation.action == "INCORRECT":
+            retrieval_action = "INCORRECT"
+    
+    print(f"Overall retrieval action: {retrieval_action}")
+    
+    # Step 3: Route based on evaluation
+    if retrieval_action == "CORRECT":
+        # All chunks are highly relevant — use them directly
+        all_context = [r.document.content for r in results]
+    
+    elif retrieval_action == "AMBIGUOUS":
+        # Some chunks partially relevant — refine them + add web search
+        for r in results:
+            chunk_text = r.document.content
+            # Distill: keep only sentences relevant to the query
+            refined = self._refine_chunk(question, chunk_text)
+            if refined:
+                all_context.append(refined)
+        
+        # Supplement with web search
+        web_query = self.web_searcher.rewrite_query_for_web(question)
+        web_results = self.web_searcher.search(web_query)
+        all_context.extend(web_results)
+    
+    elif retrieval_action == "INCORRECT":
+        # All chunks irrelevant — discard completely, use web only
+        web_query = self.web_searcher.rewrite_query_for_web(question)
+        web_results = self.web_searcher.search(web_query)
+        all_context = web_results
+    
+    # Step 4: Generate answer from selected context
+    answer = self._generate_answer(question, all_context)
+    
+    return answer, CRAGResult(
+        action=retrieval_action,
+        per_chunk_evaluations=per_chunk_actions,
+        web_searched=(retrieval_action != "CORRECT")
+    )
+```
+
+---
+
+## Chunk Refinement (AMBIGUOUS Path)
+
+When an action is AMBIGUOUS, the relevant sentences are extracted:
+
+```python
+def _refine_chunk(self, query: str, chunk_text: str) -> str:
+    """
+    For AMBIGUOUS chunks: extract only the sentences relevant to the query.
+    Discards off-topic sentences while preserving useful content.
+    """
     messages = [
         {
             "role": "system",
             "content": (
-                "You are a relevance evaluator. "
-                "Score how relevant the document is to answering the query. "
-                'Respond with JSON: {"relevance_score": <float between 0.0 and 1.0>}'
-            ),
+                "Extract and return only the sentences from the context that are "
+                "relevant to answering the query. If no sentences are relevant, "
+                "return an empty string. Do not add, summarize, or modify content."
+            )
         },
         {
             "role": "user",
-            "content": f"Query: {query}\n\nDocument: {document}",
-        },
+            "content": f"Query: {query}\n\nContext:\n{chunk_text}\n\nExtract relevant sentences:"
+        }
     ]
-    result = self.llm.chat_json(messages)
-    score = result.get("relevance_score", 0.5)
-    return max(0.0, min(1.0, float(score)))
-```
-
-A score of 0.0 means "completely irrelevant"; 1.0 means "perfectly answers the query." The LLM evaluates each document independently and returns a structured JSON score.
-
-### The Full CRAG Pipeline
-
-```python
-def crag(self, query: str) -> CRAGResponse:
-    # Step 1: Retrieve
-    results = self._retrieve(query)
-    docs = [(r.document.content, r.score) for r in results]
-    
-    # Step 2: Evaluate relevance
-    relevance_scores = []
-    for content, sim_score in docs:
-        rel_score = self._evaluate_relevance(query, content)
-        relevance_scores.append(rel_score)
-    
-    max_score = max(relevance_scores)
-    best_doc = docs[relevance_scores.index(max_score)][0]
-    
-    # Step 3: Decide action
-    if max_score > self.high_threshold:       # 0.7
-        action = "correct"
-        final_knowledge = best_doc
-        sources = [("Retrieved document", "")]
-        
-    elif max_score < self.low_threshold:      # 0.3
-        action = "incorrect"
-        final_knowledge, sources = self._web_search(query)
-        
-    else:                                      # ambiguous
-        action = "ambiguous"
-        refined_local = self._refine_knowledge(best_doc)
-        web_knowledge, web_sources = self._web_search(query)
-        final_knowledge = f"Local Knowledge:\n{refined_local}\n\nWeb Knowledge:\n{web_knowledge}"
-        sources = [("Retrieved document", "")] + web_sources
-    
-    # Step 4: Generate response
-    answer = self._generate_response(query, final_knowledge, sources)
-    
-    return CRAGResponse(answer=answer, action=action, sources=sources,
-                       relevance_scores=relevance_scores, max_score=max_score,
-                       context_used=[final_knowledge])
-```
-
-### Web Search Fallback
-
-When action is INCORRECT or AMBIGUOUS, CRAG performs a web search to supplement or replace local knowledge:
-
-```python
-def _web_search(self, query: str) -> Tuple[str, List[Tuple[str, str]]]:
-    # Rewrite query for better web results
-    rewritten = self._rewrite_query_for_web(query)
-    
-    # Search DuckDuckGo (no API key required)
-    web_results = web_search_duckduckgo(rewritten, max_results=3)
-    
-    sources = [(r["title"], r["link"]) for r in web_results]
-    raw_text = "\n\n".join(
-        f"Source: {r['title']}\n{r['snippet']}" for r in web_results
-    )
-    
-    # Refine: extract key points from web snippets
-    refined = self._refine_knowledge(raw_text)
-    return refined, sources
-```
-
-#### Query Rewriting for Web
-
-```python
-def _rewrite_query_for_web(self, query: str) -> str:
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a search query optimizer. "
-                "Rewrite the query to get better web search results. "
-                'Respond with JSON: {"rewritten_query": "<optimized query>"}'
-            ),
-        },
-        {"role": "user", "content": f"Original query: {query}"},
-    ]
-    result = self.llm.chat_json(messages)
-    return result.get("rewritten_query", query)
-```
-
-User queries are often conversational ("what does the report say about X?"). Web search engines work better with keyword-style queries. The rewriter transforms the former into the latter.
-
-### Knowledge Refinement
-
-Raw web results contain noise — navigation text, ads, irrelevant snippets. CRAG filters them:
-
-```python
-def _refine_knowledge(self, raw_text: str) -> str:
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Extract the key information from the following text as concise bullet points. "
-                "Focus on facts that would help answer a question. "
-                'Respond with JSON: {"key_points": ["point1", "point2", ...]}'
-            ),
-        },
-        {"role": "user", "content": raw_text},
-    ]
-    result = self.llm.chat_json(messages)
-    points = result.get("key_points", [])
-    return "\n".join(f"• {p}" for p in points)
+    refined = self.llm.chat(messages).strip()
+    return refined if refined and "no sentences" not in refined.lower() else ""
 ```
 
 ---
 
-## The AMBIGUOUS Case: Best of Both Worlds
+## LLM Call Budget
 
-The most interesting action is AMBIGUOUS. Here's what happens:
+Understanding the cost of CRAG is essential for deployment decisions:
 
-1. Local document is *partially* relevant (score 0.3–0.7)
-2. CRAG refines the local document — extracting its most relevant points
-3. CRAG also performs a web search
-4. Both refined local knowledge AND web knowledge are combined
-5. The LLM generates an answer with access to both sources
+| Action Path | LLM Calls |
+|------------|-----------|
+| CORRECT (k=3 chunks, no web) | k evaluations + 1 generation = 4 |
+| AMBIGUOUS (k=3 chunks, web) | k evaluations + k refinements + 1 generation = 7 |
+| INCORRECT (k=3, web only) | k evaluations + 1 web rewrite + 1 generation = 5 |
 
-This is the most powerful outcome: using domain-specific local knowledge (from your carefully curated corpus) augmented with fresh web information. Neither source alone would have been optimal.
+**Baseline standard RAG**: 1 LLM call (generation only)  
+**CRAG overhead**: 3-6 additional LLM calls  
+**CRAG latency**: 5-15 additional seconds (depending on path)
+
+For applications where accuracy is paramount (medical, legal, research) this overhead is entirely justified. For high-throughput, latency-sensitive consumer apps, standard RAG or cheaper evaluation methods should be used.
 
 ---
 
-## The CRAGResponse Dataclass
+## When CRAG Prevents Hallucination
+
+### Scenario: Knowledge Cutoff Gap
+
+User query: "What is OpenAI's latest released model as of 2025?"
+
+**Vector store** (indexed in 2024): Returns chunks about GPT-4o and o1 models. These are the latest models *in the vector store* — but not as of 2025.
+
+**Without CRAG**: LLM receives outdated context, asserts "the latest model is GPT-4o" — incorrect answer.
+
+**With CRAG**: 
+- Evaluator scores retrieval: "Document discusses models from 2024, but the query asks for 2025 — potentially outdated" → AMBIGUOUS
+- Web search executes → retrieves current 2025 model information
+- LLM correctly answers from web content
+
+### Scenario: Corpus Coverage Gap
+
+User query: "How did Hurricane Milton affect Tampa Bay in 2024?"
+
+**Vector store**: No documents about Hurricane Milton (not in the corpus).
+
+**Without CRAG**: FAISS returns the most similar vectors (other hurricane-related content). LLM may confuse details from other storms.
+
+**With CRAG**:
+- Evaluator scores: "Document discusses hurricane preparedness generally, no mention of Milton or Tampa Bay in 2024" → INCORRECT
+- Web search retrieves Hurricane Milton coverage → accurate answer
+
+---
+
+## Configuring Action Thresholds
 
 ```python
-@dataclass
-class CRAGResponse:
-    answer: str
-    action: str           # "correct" | "incorrect" | "ambiguous"
-    sources: List[Tuple[str, str]]
-    relevance_scores: List[float]
-    max_score: float
-    context_used: List[str]
+# Conservative (higher bar for CORRECT, more web fallback)
+evaluator = RelevanceEvaluator(
+    correct_threshold=0.8,   # Must be very relevant to avoid web
+    incorrect_threshold=0.4  # Tolerates more ambiguity before fallback
+)
+
+# Aggressive (lower bar for CORRECT, less web fallback)
+evaluator = RelevanceEvaluator(
+    correct_threshold=0.6,   # Proceed with moderate relevance
+    incorrect_threshold=0.2  # Only fully irrelevant triggers web
+)
 ```
 
-Full metadata is returned for monitoring, logging, and debugging. Production systems can track action distributions to measure how often local retrieval is adequate vs. requiring web fallback.
+**When to be conservative**: Knowledge-critical applications (medical Q&A, financial research) — prefer web fallback over risk of wrong context.
 
----
-
-## Cost Analysis
-
-CRAG adds LLM API calls compared to standard RAG:
-
-| Step | API calls |
-|------|-----------|
-| Relevance evaluation | k calls (1 per retrieved doc) |
-| Query rewriting (if web) | 1 call |
-| Knowledge refinement (if web) | 1 call |
-| Answer generation | 1 call |
-| **Total (CORRECT action)** | k + 1 calls |
-| **Total (INCORRECT action)** | k + 3 calls |
-| **Total (AMBIGUOUS action)** | k + 4+ calls |
-
-With k=3 retrieved docs, CORRECT action costs 4 LLM calls vs. 1 for standard RAG. This is the price of validated, reliable retrieval.
+**When to be aggressive**: Latency-sensitive applications, stable corpora, high cost of web calls — prefer fewer web searches when retrieval is "good enough."
 
 ---
 
 ## When to Use CRAG
 
-**Best for:**
-- Queries that may reach beyond your corpus (current events, niche topics)
-- High-stakes applications where "I don't know" is better than a confident wrong answer
-- Production systems serving diverse user queries over constrained knowledge bases
-- Medical, legal, or financial domains where retrieval failures have real consequences
+CRAG is the right choice when your vector store cannot be trusted to cover all the queries users will ask. If the corpus has a knowledge cutoff, is narrowly scoped while users ask broad questions, or changes slowly while user needs evolve faster, CRAG's web fallback provides a meaningful safety net against confident-but-wrong answers.
 
-**Skip when:**
-- Corpus is comprehensive for the query domain and web fallback isn't allowed
-- Cost per query is tightly constrained (CRAG is significantly more expensive)
-- Low latency is critical (evaluation + web search adds several seconds)
+For high-stakes applications — medical Q&A, financial research, legal lookups — the cost of a wrong answer far outweighs the overhead of additional LLM evaluation calls and web search latency. CRAG's three-action decision framework makes that tradeoff explicit and configurable.
+
+Where CRAG is inappropriate: air-gapped deployments with no web access, systems where every answer must come from the existing corpus for compliance or policy reasons, and latency-sensitive applications where the AMBIGUOUS or INCORRECT paths (each adding several LLM calls and web round trips) would breach SLAs.
 
 ---
 
 ## Summary
 
-CRAG transforms retrieval from a blind lookup into an intelligent, evaluated decision. By scoring retrieved documents and choosing between local context, web search, or both — based on explicit relevance thresholds — CRAG dramatically reduces the risk of confidently answering from irrelevant context.
+CRAG transforms RAG from a pipeline that blindly trusts retrieval into one that critically evaluates it. The three-action decision framework — CORRECT, AMBIGUOUS, INCORRECT — routes each query through the minimum amount of additional work needed to ensure high-quality context for generation.
 
-The three-action framework (CORRECT / INCORRECT / AMBIGUOUS) is elegantly practical: it handles the full spectrum from "our corpus is perfect for this query" to "we have no relevant information locally" to "we have partial information worth combining with external data." Production RAG systems operating over bounded knowledge bases should seriously consider CRAG as a reliability layer.
+The key insight is that embedding similarity is a good *first filter*, but an insufficient *quality guarantee*. By adding an LLM-based relevance evaluator between retrieval and generation, CRAG catches the cases that embedding similarity misses and corrects them — either by refining partial context or by falling back to web search for completely missed queries.
+
+For applications where the cost of a wrong answer exceeds the cost of additional LLM calls, CRAG is a principled, measurable improvement in reliability.

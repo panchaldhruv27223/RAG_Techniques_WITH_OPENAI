@@ -1,241 +1,344 @@
-# Reliable RAG: Catching Hallucinations Before They Reach the User
-
-> **Technique:** Reliable RAG (Hallucination Detection)  
-> **Complexity:** Intermediate  
-> **Key Libraries:** `openai`, `faiss-cpu`
+# Reliable RAG: Building Systems That Know What They Don't Know
 
 ---
 
 ## Introduction
 
-The central promise of RAG is grounding: by providing the LLM with retrieved context, we expect answers to be rooted in real documents rather than fabricated from training data. But RAG doesn't *guarantee* grounding. LLMs can still hallucinate details, blend retrieved facts with invented ones, or produce technically accurate-sounding statements that aren't supported by the provided context.
+LLMs hallucinate. This is not a bug to be fixed but a fundamental characteristic of probabilistic token prediction: when the model lacks strong grounding evidence, it generates plausible-but-wrong text with the same fluent confidence as correct text. In RAG systems, hallucination takes a specific form — the model generates claims that go *beyond* or *contradict* the retrieved context.
 
-**Reliable RAG** adds an explicit hallucination detection layer that validates generated answers against retrieved context *before returning them to the user*. If the answer can't be verified against the source material, the system flags it — or in strict mode, refuses to return it.
+**Reliable RAG** addresses this directly by adding a post-generation verification stage. After generating an answer, it:
 
-This technique is about building trust: not just generating answers, but proving those answers are supported.
+1. **Extracts individual claims** from the answer (each discrete factual assertion)
+2. **Verifies each claim** against the retrieved context
+3. **Labels claims** as SUPPORTED, UNSUPPORTED, or UNCERTAIN
+4. **Computes a reliability score** from the claim verification results
+5. **Makes a reliability decision**: Output the answer with a confidence tag, modify it to remove unsupported claims, or decline to answer with caveats
 
----
-
-## The Core Problem: RAG Doesn't Eliminate Hallucination
-
-Consider this failure case:
-
-**Context retrieved**: "The Treaty of Versailles was signed on June 28, 1919."
-
-**LLM answer**: "The Treaty of Versailles, signed on June 28, 1919, which ended World War I and imposed heavy reparations of $442 billion on Germany, was ratified by the League of Nations in 1920."
-
-Two problems:
-1. The $442 billion figure is not in the context (and is inaccurate)
-2. The ratification detail is not in the context
-
-RAG retrieved a good chunk. The LLM then added plausible-sounding additional "facts" from its training knowledge, creating a response that mixes verified and unverified information — and the user has no way to tell the difference.
-
-Reliable RAG catches this.
+The output is not just an answer — it's an audited answer with a documented confidence level, enabling users and systems to make appropriate trust decisions.
 
 ---
 
-## How Reliable RAG Works
+## Why LLM-Generated Answers Can't Be Trusted Unconditionally
 
-### Pipeline
+### The Extrapolation Problem
 
-```
-User Query
-    ↓
-Standard vector retrieval → top-k chunks
-    ↓
-LLM generates answer (standard generation)
-    ↓
-[Hallucination Detector]
-    ↓ Breaks answer into individual claims
-    ↓ Checks each claim against retrieved context
-    ↓ Scores: verified / partially_verified / unverified / irrelevant
-    ↓
-Compute hallucination_rate = unverified_claims / total_claims
-    ↓
-If rate > threshold → respond = "Cannot verify this answer"
-Else → return answer + transparency report
-```
+RAG retrieves relevant context and asks the LLM to answer from it. But LLMs don't strictly confine themselves to the retrieved text. Consider:
 
-### Claim Extraction
+**Retrieved context**: "Aspirin reduces fever by inhibiting COX enzymes. Studies show it is effective for mild-to-moderate pain management."
+
+**LLM-generated answer**: "Aspirin reduces fever by inhibiting COX enzymes and is effective for mild-to-moderate pain. The recommended adult dose is 325-650mg every 4-6 hours, and it should not be given to children under 12 due to Reye's syndrome risk."
+
+The bolded text is *not* in the retrieved context. The LLM has drawn on prior knowledge — which may be correct, but isn't grounded in the retrieved evidence. For high-stakes applications (medical, legal, financial), this unverified extrapolation is unacceptable.
+
+### The Confidence Illusion
+
+LLMs generate text with equal fluency regardless of how confident they are. "The capital of France is Paris" and "The GDP of Zambia in 1973 was $X billion" are expressed in identically confident syntax. Users have no way to distinguish grounded claims from confabulated ones — unless the system explicitly detects and labels them.
+
+---
+
+## The Claim Extraction Pipeline
+
+### Step 1: Decompose the Answer into Atomic Claims
 
 ```python
-def _extract_claims(self, answer: str) -> List[str]:
+def extract_claims(self, answer: str) -> List[Claim]:
+    """
+    Decompose the answer into individual, atomic, verifiable claims.
+    
+    An 'atomic claim' is the smallest unit of verifiable assertion:
+    - Not a question
+    - Not an opinion (unless the opinion is attributed)
+    - Not a conjunction of two independent claims
+    
+    Examples of atomic claims:
+    ✓ "Aspirin inhibits COX-1 and COX-2 enzymes"
+    ✓ "The boiling point of water is 100°C at sea level"
+    ✗ "Aspirin reduces pain and fever and has anti-inflammatory properties"  (too many claims combined)
+    """
     messages = [
         {
             "role": "system",
             "content": (
-                "Break down the answer into individual factual claims. "
-                "Each claim should be a single verifiable statement. "
-                'Return JSON: {"claims": ["claim1", "claim2", ...]}'
-            )
-        },
-        {"role": "user", "content": f"Answer:\n{answer}"}
-    ]
-    result = self.llm.chat_json(messages)
-    return result.get("claims", [])
-```
-
-This step decomposes the answer into atomic, individually verifiable statements. "The Treaty of Versailles, signed in 1919, imposed reparations on Germany" becomes three claims:
-1. "The Treaty of Versailles was signed in 1919"
-2. "The Treaty of Versailles imposed reparations"
-3. "The reparations were imposed on Germany"
-
-### Claim Verification
-
-```python
-def _verify_claim(self, claim: str, context: str) -> str:
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Verify if the claim is supported by the context. "
-                'Return JSON: {"status": "verified"} or {"status": "partially_verified"} '
-                'or {"status": "unverified"} or {"status": "irrelevant"}\n\n'
-                "verified: directly supported by context text\n"
-                "partially_verified: partially supported, some details not confirmed\n"
-                "unverified: contradicts or not found in context\n"
-                "irrelevant: claim is about general knowledge, not specific to the question"
+                "Extract all factual claims from the given text as a list of "
+                "simple, atomic statements. Each claim should:\n"
+                "1. Contain exactly ONE verifiable fact\n"
+                "2. Be a complete, self-contained statement\n"
+                "3. Use specific language (no vague terms like 'some' or 'many')\n"
+                "4. Not overlap significantly with other claims\n\n"
+                "Do not include opinions, definitions, or methodological descriptions.\n\n"
+                'Return JSON: {"claims": ["claim 1", "claim 2", ...]}'
             )
         },
         {
             "role": "user",
-            "content": f"Claim: {claim}\n\nContext: {context}"
+            "content": f"Extract all factual claims from:\n\n{answer}"
         }
     ]
     result = self.llm.chat_json(messages)
-    return result.get("status", "unverified")
+    claim_texts = result.get("claims", [])
+    
+    return [
+        Claim(text=claim_text, status=ClaimStatus.UNVERIFIED)
+        for claim_text in claim_texts
+        if claim_text.strip()
+    ]
 ```
 
-Four verification states capture the full spectrum between "definitely in the context" and "definitely not in the context":
-
-| Status | Meaning | Action |
-|--------|---------|--------|
-| `verified` | Directly supported by context text | ✅ Safe |
-| `partially_verified` | Partially supported, some details unclear | ⚠️ Flag |
-| `unverified` | Not found in or contradicts context | ❌ Hallucination |
-| `irrelevant` | General background knowledge | ℹ️ Neutral |
-
-### Hallucination Rate Calculation
+### Step 2: Verify Each Claim Against the Context
 
 ```python
-status_counts = {
-    "verified": 0, "partially_verified": 0, 
-    "unverified": 0, "irrelevant": 0
-}
-for claim in claims:
-    status = self._verify_claim(claim, context_text)
-    claim_verifications.append({"claim": claim, "status": status})
-    status_counts[status] += 1
-
-factual_claims = len(claims) - status_counts["irrelevant"]
-if factual_claims > 0:
-    hallucination_rate = status_counts["unverified"] / factual_claims
-else:
-    hallucination_rate = 0.0
-```
-
-`irrelevant` claims (general background knowledge) are excluded from the denominator — it's unfair to penalize the LLM for correctly stating that "gravity is the force that attracts objects" when the context doesn't explicitly contain that fact.
-
-### The Reliability Decision
-
-```python
-is_reliable = hallucination_rate <= self.hallucination_threshold  # default: 0.2
-
-if is_reliable:
-    final_answer = answer
-else:
-    final_answer = (
-        "I cannot provide a verified answer to this question. "
-        "The retrieved information may be insufficient or the question "
-        "may require knowledge not present in the documents."
+def verify_claim(self, claim: str, context: str) -> VerificationResult:
+    """
+    Check whether a specific claim is supported by the retrieved context.
+    
+    Verification labels:
+    - SUPPORTED: Claim is explicitly stated or directly inferrable from context
+    - UNSUPPORTED: Claim makes an assertion not found in context (potential hallucination)
+    - UNCERTAIN: Context is ambiguous about this claim, or partially addresses it
+    """
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Verify if the given claim is supported by the provided context.\n\n"
+                "SUPPORTED: The claim is directly stated or clearly follows from the context.\n"
+                "UNSUPPORTED: The claim makes an assertion not in the context "
+                "(hallucination risk — the model may be using prior knowledge).\n"
+                "UNCERTAIN: The context partially addresses the claim but is ambiguous.\n\n"
+                'Return JSON: {"status": "SUPPORTED|UNSUPPORTED|UNCERTAIN", '
+                '"evidence": "relevant quote from context or empty string", '
+                '"reasoning": "brief explanation"}'
+            )
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Claim to verify: {claim}\n\n"
+                f"Context:\n{context[:3000]}\n\n"
+                "Is this claim supported by the context?"
+            )
+        }
+    ]
+    result = self.llm.chat_json(messages)
+    
+    return VerificationResult(
+        status=result.get("status", "UNCERTAIN"),
+        evidence=result.get("evidence", ""),
+        reasoning=result.get("reasoning", "")
     )
 ```
 
-A `hallucination_threshold=0.2` means: if more than 20% of factual claims are unverifiable against retrieved context, refuse to return the answer. Adjust this based on your application's risk tolerance:
-
-- **High-risk domain (medical, legal)**: threshold = 0.05 (5% max unverified)
-- **Enterprise knowledge base**: threshold = 0.20 (20%)
-- **General Q&A**: threshold = 0.30 (30%)
-
----
-
-## The Reliability Report
-
-Reliable RAG returns a rich structured response:
+### Step 3: Compute Reliability Score
 
 ```python
-@dataclass
-class ReliabilityReport:
-    answer: str
-    is_reliable: bool
-    hallucination_rate: float   # 0.0 = no hallucinations, 1.0 = fully hallucinated
-    claim_verifications: List[Dict[str, str]]  # [{claim, status}, ...]
-    status_counts: Dict[str, int]
-    context_used: List[str]
-    final_answer: str           # may be refusal if unreliable
+def compute_reliability_score(self, claims: List[VerifiedClaim]) -> ReliabilityReport:
+    """
+    Aggregate claim verification results into a overall reliability score.
+    
+    Formula:
+    reliability = (supported + 0.5 × uncertain) / total_claims
+    
+    Why 0.5 for uncertain? These claims might be correct (partial support)
+    but shouldn't count fully toward the reliability score.
+    """
+    if not claims:
+        return ReliabilityReport(score=1.0, level="HIGH", claims=claims)
+    
+    supported = sum(1 for c in claims if c.status == "SUPPORTED")
+    uncertain = sum(1 for c in claims if c.status == "UNCERTAIN")
+    unsupported = sum(1 for c in claims if c.status == "UNSUPPORTED")
+    total = len(claims)
+    
+    reliability_score = (supported + 0.5 * uncertain) / total
+    
+    # Convert to reliability level
+    if reliability_score >= 0.85:
+        level = "HIGH"
+        recommendation = "Answer is well-grounded in retrieved context"
+    elif reliability_score >= 0.65:
+        level = "MEDIUM"
+        recommendation = "Answer is mostly grounded; review uncertain claims"
+    else:
+        level = "LOW"
+        recommendation = "Answer contains unsupported claims; do not use without verification"
+    
+    print(f"📊 Reliability: {reliability_score:.2f} ({level})")
+    print(f"   Supported: {supported} | Uncertain: {uncertain} | Unsupported: {unsupported}")
+    
+    return ReliabilityReport(
+        score=reliability_score,
+        level=level,
+        recommendation=recommendation,
+        supported_count=supported,
+        uncertain_count=uncertain,
+        unsupported_count=unsupported,
+        total_claims=total,
+        claims=claims
+    )
 ```
-
-Every claim is individually tagged with its verification status. This enables:
-
-1. **User transparency**: "Here's the answer, and here are the claims we could verify."
-2. **Developer debugging**: "This claim about X is always unverified — maybe we need more source documents?"
-3. **Audit trails**: Full verification records for compliance or review processes.
 
 ---
 
-## Configuration
+## The Reliability Decision Engine
+
+Based on the reliability score and level, the system makes one of three decisions:
 
 ```python
-class ReliableRAG:
-    def __init__(self,
-                 file_path: str,
-                 chunk_size: int = 1000,
-                 chunk_overlap: int = 200,
-                 k: int = 3,
-                 hallucination_threshold: float = 0.2,  # max fraction unverified
-                 embedding_model: str = "text-embedding-3-small",
-                 chat_model: str = "gpt-4o-mini"):
+def make_reliability_decision(
+    self,
+    original_answer: str,
+    reliability_report: ReliabilityReport,
+    query: str,
+    context: str
+) -> FinalOutput:
+    
+    if reliability_report.level == "HIGH":
+        # All (or nearly all) claims are grounded — output with confidence marker
+        return FinalOutput(
+            answer=original_answer,
+            confidence="HIGH",
+            caveat=None,
+            modified=False
+        )
+    
+    elif reliability_report.level == "MEDIUM":
+        # Partially grounded — remove unsupported claims and add a disclaimer
+        cleaned_answer = self._remove_unsupported_claims(
+            original_answer,
+            reliability_report.claims
+        )
+        return FinalOutput(
+            answer=cleaned_answer,
+            confidence="MEDIUM",
+            caveat=(
+                "Note: Some claims in the original answer could not be verified "
+                "against the retrieved context and have been removed. "
+                "Please verify with primary sources before relying on this answer."
+            ),
+            modified=True
+        )
+    
+    else:  # LOW
+        # Too many unsupported claims — decline to answer fully, offer what's verified
+        verified_facts = [
+            c.text for c in reliability_report.claims 
+            if c.status == "SUPPORTED"
+        ]
+        if verified_facts:
+            safe_answer = (
+                "Based on the retrieved context, the following can be confirmed:\n"
+                + "\n".join(f"• {fact}" for fact in verified_facts)
+                + "\n\nAdditional information could not be verified from the available context."
+            )
+        else:
+            safe_answer = (
+                "The retrieved context does not contain sufficient information to "
+                "reliably answer this question. Please consult authoritative sources."
+            )
+        
+        return FinalOutput(
+            answer=safe_answer,
+            confidence="LOW",
+            caveat="Answer limited to context-verified claims.",
+            modified=True
+        )
 ```
 
 ---
 
-## LLM Call Overhead
+## Worked Example: Claim-Level Verification in Action
 
-For a query producing an answer with N claims:
+**Query**: "What is the mechanism and dosing of metformin for type 2 diabetes?"
 
-| Standard RAG | Reliable RAG |
-|-------------|-------------|
-| 1 generation call | 1 generation + 1 extraction + N verification calls |
+**Retrieved context** (abbreviated): "Metformin reduces hepatic glucose production by activating AMPK. In clinical trials, first-line metformin therapy reduces HbA1c by approximately 1.5%. It is generally well-tolerated with the most common side effects being GI upset."
 
-With N=5 claims and k=3, Reliable RAG runs 7 LLM calls vs. 1. Each verification call is short (a claim + context, scored as one of four options), so they're fast and inexpensive.
+**Generated answer**: "Metformin works by activating AMPK to reduce hepatic glucose output. It typically reduces HbA1c by 1.5%. The standard starting dose is 500mg twice daily, titrating to 2000mg/day maximum. It should be avoided in patients with eGFR < 30."
+
+**Claim extraction**:
+1. "Metformin works by activating AMPK to reduce hepatic glucose output"
+2. "It typically reduces HbA1c by 1.5%"
+3. "The standard starting dose is 500mg twice daily"
+4. "Maximum dose is 2000mg/day"
+5. "Should be avoided in patients with eGFR < 30"
+
+**Verification results**:
+
+| Claim | Status | Evidence |
+|-------|--------|---------|
+| 1 | SUPPORTED | "reduces hepatic glucose production by activating AMPK" |
+| 2 | SUPPORTED | "reduces HbA1c by approximately 1.5%" |
+| 3 | UNSUPPORTED | Dosing not in retrieved context |
+| 4 | UNSUPPORTED | Maximum dose not in retrieved context |
+| 5 | UNSUPPORTED | eGFR threshold not in retrieved context |
+
+**Reliability score**: (2 supported + 0.5 × 0 uncertain) / 5 = 0.40 → **LOW**
+
+**Decision**: The dosing claims (3, 4, 5) are plausible (and may even be correct) but they're extrapolated from the LLM's training data, not from the retrieved context. For a medical application, this distinction is critical.
+
+**Final output**: The system returns only the two verified claims (mechanism + HbA1c) with a disclaimer that dosing should be verified from authoritative clinical sources.
 
 ---
 
-## Beyond Hallucination: A Forcing Function for Better Source Documents
+## LLM Call Budget
 
-Reliable RAG has a productive side effect: it highlights gaps in your knowledge base. If certain query types consistently produce high hallucination rates, it means your corpus doesn't contain sufficient information for those queries. This is *actionable intelligence* — add more source documents covering those topics and watch the hallucination rate drop.
+For k=3 retrieved chunks and N extracted claims (typically 3-8 claims per answer):
+
+| Phase | Calls |
+|-------|-------|
+| Standard retrieval | 0 |
+| Generation | 1 |
+| Claim extraction | 1 |
+| Claim verification (N claims) | N |
+| Total | 2 + N ≈ 6-10 |
+
+For N=5 claims: 7 total LLM calls. Comparable to Self-RAG in cost but different focus:
+- Self-RAG prevents hallucination at generation time (proactive)
+- Reliable RAG detects it after generation and allows controlled degradation (reactive)
+
+---
+
+## Production Integration Patterns
+
+### Pattern 1: Silent Confidence Scoring
+Return the answer + a reliability score to the UI, which displays a confidence indicator:
+```json
+{"answer": "...", "reliability": 0.91, "level": "HIGH"}
+```
+
+### Pattern 2: User-Facing Caveats
+Append reliability-dependent disclaimers to answers. "HIGH" answers get none. "MEDIUM" get soft disclaimers. "LOW" get explicit warnings.
+
+### Pattern 3: Automatic Escalation
+When reliability falls below a threshold, automatically route to a human expert or premium LLM for verification:
+```python
+if reliability.score < 0.65:
+    return escalate_to_expert(query, answer, reliability)
+```
+
+### Pattern 4: Audit Logging
+Log all claim-level verifications for compliance and quality monitoring:
+```python
+audit_log.record(
+    query=query,
+    claims=reliability.claims,
+    unsupported=[c for c in reliability.claims if c.status == "UNSUPPORTED"]
+)
+```
 
 ---
 
 ## When to Use Reliable RAG
 
-**Best for:**
-- Medical, legal, financial, or compliance applications where false statements have real consequences
-- Enterprise systems where the LLM may confabulate policy details
-- Public-facing systems where reputational risk from hallucinations is high
-- Audit-required environments requiring traceable answer verification
+Reliable RAG is appropriate when the downstream cost of a hallucinated answer is high enough to justify its computational overhead. Medical question answering, legal research, financial advisory tools, and compliance systems all share the property that a confident wrong answer is meaningfully worse than an explicit low-confidence response. For these cases, the claim extraction and verification pipeline is a straightforward tradeoff against the risk.
 
-**Skip when:**
-- Your corpus is broad and queries are general knowledge (most claims will be "irrelevant")
-- Latency is critical and 7× LLM overhead is unacceptable
-- Cost per query is tightly constrained
+For general-purpose information lookup where hallucination rates are inherently low and users can tolerate occasional imprecision, the overhead is harder to justify. High-traffic applications also need to account for the cost multiplication — at 7+ extra LLM calls per query, the economics require careful modeling. Where query volume is high and the domain is lower-stakes, a single-pass generation with standard retrieval will often suffice.
 
 ---
 
 ## Summary
 
-Reliable RAG treats answer generation not as the final step but as a draft requiring verification. By decomposing answers into claims, checking each claim against retrieved context, and computing a hallucination rate, it makes the RAG system's groundedness explicit and measurable.
+Reliable RAG acknowledges a fundamental truth about LLMs: they don't know what they don't know. By decomposing generated answers into atomic claims and verifying each against the retrieved context, it transforms opaque LLM outputs into auditable, confidence-labeled responses.
 
-For high-stakes applications, this transforms RAG from "trustworthy by assumption" to "trustworthy by proof." Users don't just receive answers — they receive verified answers, with a clear indication when verification fails.
+The reliability score is not just a monitoring metric — it's an operational signal. LOW reliability triggers answer modification or decline. MEDIUM triggers caveat injection. HIGH grants full confidence. This three-tier decision framework allows the system to be maximally useful when ground truth is available and appropriately cautious when it isn't.
 
-In a world where LLM hallucination is still an unsolved problem, building an explicit verification layer like Reliable RAG is the responsible choice for production deployments where accuracy matters.
+For any RAG application where incorrect answers are costly, Reliable RAG changes the system's stance from "generate and hope" to "generate and verify" — a fundamental improvement in trustworthiness.

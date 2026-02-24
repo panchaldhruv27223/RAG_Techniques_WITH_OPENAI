@@ -1,205 +1,435 @@
 # Simple RAG: The Foundation of Retrieval-Augmented Generation
 
-> **Technique:** Simple RAG  
-> **Complexity:** Beginner  
-> **Key Libraries:** `openai`, `faiss-cpu`, `PyMuPDF`
+**Source:** `simple_rag/` · **Libraries:** `openai`, `faiss-cpu`, `PyMuPDF`
 
 ---
 
 ## Introduction
 
-Every sophisticated system starts with a solid foundation. In the world of Retrieval-Augmented Generation (RAG), that foundation is **Simple RAG** — a straightforward pipeline that connects a knowledge base to a language model, enabling it to answer questions grounded in real documents rather than relying purely on its training data.
+Every sophisticated system starts with a solid foundation. In the world of Retrieval-Augmented Generation (RAG), that foundation is **Simple RAG** — a clean, three-phase pipeline that connects a knowledge base to a language model, enabling it to answer questions grounded in real documents rather than relying purely on its training data.
 
-If you're new to RAG, this is your starting point. If you're a seasoned practitioner, revisiting the basics regularly keeps your mental model sharp.
+Large Language Models are tremendous at reasoning, summarization, and synthesis. But they have two critical limitations that make them unsuitable as standalone tools for enterprise use cases:
 
----
+1. **Knowledge cutoff**: LLMs are trained on corpora with a fixed end date. GPT-4's training data has a cutoff; anything after that simply doesn't exist in the model's world.
+2. **Private data blindness**: No LLM has access to your company's internal reports, proprietary datasets, customer contracts, or confidential research. These documents live outside the training pipeline entirely.
 
-## The Core Problem RAG Solves
-
-Large Language Models (LLMs) like GPT-4 are trained on enormous corpora of text, giving them broad world knowledge. But they have two critical limitations:
-
-1. **Knowledge cutoff**: They don't know about events after their training date.
-2. **Private data blindness**: They have no access to your proprietary documents, internal reports, or customer records.
-
-RAG bridges this gap by giving the LLM a retrieval system — a way to look up relevant information at query time before generating a response. Think of it as giving the model open-book access instead of forcing it to work from memory.
+RAG bridges this gap with a simple but profound idea: at question-answering time, *retrieve* the relevant information from your documents first, then *give* that information to the LLM as context before asking it to generate a response. The LLM, now reading from your private, up-to-date documents, can answer accurately.
 
 ---
 
-## How Simple RAG Works
+## The Conceptual Model
 
-The pipeline has three distinct phases:
+Think of RAG as giving the LLM "open-book access" instead of forcing it to work from memory alone. 
 
-### Phase 1: Indexing (Offline)
+In a closed-book exam, a student must recall everything from training. In an open-book exam, the student can look things up — but must still reason and synthesize. RAG turns every LLM query into an open-book exam: the model consults retrieved documents before writing its answer.
 
-Before any query is answered, the source documents must be processed and stored:
-
-```
-Raw Documents (PDF / CSV)
-        ↓
-   Text Extraction
-        ↓
-   Text Chunking  (fixed-size chunks with overlap)
-        ↓
-   Embed each chunk  →  Vector Store (FAISS)
-```
-
-**Chunking** breaks long documents into manageable pieces. A typical configuration uses a chunk size of 1,000 characters with a 200-character overlap. The overlap ensures that context spanning two adjacent chunks isn't lost.
-
-**Embedding** converts each text chunk into a dense numerical vector using a model like `text-embedding-3-small`. These vectors capture the semantic meaning of the text, allowing similarity-based search later.
-
-### Phase 2: Retrieval (Online, per query)
-
-When a user asks a question:
-
-```
-User Query
-    ↓
-Embed query → query vector
-    ↓
-FAISS similarity search against all chunk vectors
-    ↓
-Top-k most semantically similar chunks returned
-```
-
-FAISS (Facebook AI Similarity Search) performs an extremely fast nearest-neighbor search in high-dimensional vector space. With even millions of chunks, retrieval takes milliseconds.
-
-### Phase 3: Generation (Online, per query)
-
-```
-User Query + Retrieved Chunks (context)
-    ↓
-Prompt construction
-    ↓
-LLM (GPT-4o-mini) generates grounded answer
-    ↓
-Response returned to user
-```
-
-The LLM is instructed to answer using *only* the provided context. This is key: it grounds the response in real document text, dramatically reducing hallucination.
+This has profound implications:
+- **Factual accuracy improves** because the model reads the answer rather than recalling it
+- **Hallucination decreases** because grounded responses stay tethered to real text
+- **Private knowledge becomes accessible** without retraining or fine-tuning the model
+- **Knowledge stays fresh** by updating the document store rather than retraining the model
 
 ---
 
-## Code Deep Dive
+## Architecture: The Three-Phase Pipeline
 
-Here's how the pipeline is structured in the implementation:
+Simple RAG is organized into two modes separated by the first query:
 
-```python
-class SimpleRAG:
-    def __init__(self, embedding_model="text-embedding-3-small",
-                 chat_model="gpt-4o-mini", temperature=0.0):
-        self.embedder = OpenAIEmbedder(model=embedding_model)
-        self.vector_store = FAISSVectorStore(dimension=self.embedder.dimension)
-        self.llm = OpenAIChat(model_name=chat_model, temperature=temperature)
+### Phase 1: Indexing (Offline — runs once or at update time)
+
+```
+Raw Documents (PDF, CSV, TXT, etc.)
+         │
+         ▼
+ ┌───────────────┐
+ │ Text Extraction│   (PyMuPDF for PDF → plain text)
+ └───────────────┘
+         │
+         ▼
+ ┌────────────────────┐
+ │ Text Chunking      │   Sliding window: chunk_size=1000 chars, overlap=200
+ └────────────────────┘
+         │
+         ▼
+ ┌─────────────────────────┐
+ │ Embed each chunk        │   OpenAI text-embedding-3-small → 1536-dim vector
+ └─────────────────────────┘
+         │
+         ▼
+ ┌─────────────────────┐
+ │ FAISS vector store  │   L2-indexed flat store for nearest-neighbor search
+ └─────────────────────┘
 ```
 
-The system is initialized with three modular components:
-- **`OpenAIEmbedder`**: Wraps OpenAI's embedding API
-- **`FAISSVectorStore`**: Manages the vector index for fast similarity search
-- **`OpenAIChat`**: Handles LLM generation
+This phase can take seconds for small PDFs or minutes for very large corpora. It is designed to run **once** and then support unlimited queries without re-processing.
 
-### Indexing a PDF
+### Phase 2: Query Processing (Online — runs per user query)
 
-```python
-def index_pdf(self, file_path, chunk_size=1000, chunk_overlap=200):
-    text = read_pdf(file_path)
-    chunks = chunk_text(text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    documents = [Document(content=c, metadata={"chunk_index": i})
-                 for i, c in enumerate(chunks)]
-    documents = self.embedder.embed_documents(documents)
-    self.vector_store.add_documents(documents)
+```
+User Question (natural language)
+         │
+         ▼
+ Embed question → 1536-dim query vector
+         │
+         ▼
+ FAISS similarity search → top-k most similar chunks
+         │
+         ▼
+ Construct prompt:
+   System: "Answer using this context: {chunks}"
+   User:   "{question}"
+         │
+         ▼
+ LLM (GPT-4o-mini) → generates grounded answer
+         │
+         ▼
+ Answer returned to user
 ```
 
-`chunk_text` uses a sliding-window approach: it moves through the text creating chunks of `chunk_size` characters, advancing by `chunk_size - chunk_overlap` each step. This is simple and reliable.
+Query processing typically takes 500ms–2s total: ~50ms for embedding, ~5ms for FAISS search, ~500–2000ms for LLM generation.
 
-### Querying
+---
+
+## How FAISS Works Under the Hood
+
+FAISS (Facebook AI Similarity Search) is a library for efficient similarity search in high-dimensional vector spaces. The standard configuration for Simple RAG uses a **flat L2 index** — which means every stored vector is compared to the query vector with no approximation.
+
+**Cosine similarity vs. L2 distance:** The implementation uses cosine similarity (dot product of unit-normalized vectors), which measures the *angle* between vectors rather than their *distance*. Two vectors with identical semantic content will have cosine similarity → 1.0 regardless of their magnitude. L2 distance is also consistent with cosine similarity when vectors are L2-normalized (which is standard OpenAI embedding practice).
 
 ```python
-def query(self, question, k=3):
-    query_embedding = self.embedder.embed_text(question)
-    results = self.vector_store.search(query_embedding, k=k)
-    context = "\n\n".join([r.document.content for r in results])
+# FAISS internal distance computation (simplified concept)
+# For query vector q and stored vector d:
+score = cosine_similarity(q, d) = (q · d) / (||q|| × ||d||)
+```
+
+The FAISS flat index scans every stored vector on each search. This is O(n) per query but extremely vectorized using BLAS — it can search 1 million vectors in under 100ms on a CPU.
+
+For very large corpora (>10M chunks), approximate search (IVF, HNSW) would be used to trade a small accuracy loss for dramatic speed improvements. For most enterprise use cases, the flat index is perfectly sufficient.
+
+---
+
+## Implementation Walkthrough
+
+The full implementation is built on a handful of focused classes. Here's how each one works:
+
+### OpenAIEmbedder
+
+```python
+class OpenAIEmbedder:
+    def __init__(self, model: str = "text-embedding-3-small"):
+        self.model = model
+        self.client = OpenAI()
+        self.dimension = 1536  # fixed for text-embedding-3-small
     
+    def embed_text(self, text: str) -> List[float]:
+        response = self.client.embeddings.create(
+            model=self.model,
+            input=text
+        )
+        return response.data[0].embedding
+    
+    def embed_documents(self, documents: List[Document]) -> List[Document]:
+        # Batch all documents in a single API call for efficiency
+        texts = [d.content for d in documents]
+        response = self.client.embeddings.create(
+            model=self.model,
+            input=texts  # OpenAI supports up to 2048 inputs per batch call
+        )
+        for doc, embedding_obj in zip(documents, response.data):
+            doc.embedding = embedding_obj.embedding
+        return documents
+```
+
+The `embed_documents` method batches all chunks into a single API call — crucially important for performance and cost when indexing large documents. A 100-page PDF producing 300 chunks would take 300 individual round-trips without batching, but only 1 with batching (or a small number if the batch exceeds the API limit).
+
+### FAISSVectorStore
+
+```python
+class FAISSVectorStore:
+    def __init__(self, dimension: int):
+        self.dimension = dimension
+        # Flat L2 index — exact search, no approximation
+        self.index = faiss.IndexFlatL2(dimension)
+        self.documents: List[Document] = []
+    
+    def add_documents(self, documents: List[Document]) -> None:
+        embeddings = np.array(
+            [d.embedding for d in documents],
+            dtype=np.float32
+        )
+        self.index.add(embeddings)
+        self.documents.extend(documents)
+    
+    def search(self, query_embedding: List[float], k: int) -> List[RetrievalResult]:
+        query_vec = np.array([query_embedding], dtype=np.float32)
+        # distances: L2 distances (lower = more similar)
+        # indices: positions in self.documents
+        distances, indices = self.index.search(query_vec, k)
+        
+        results = []
+        for dist, idx in zip(distances[0], indices[0]):
+            if idx < len(self.documents):
+                score = 1.0 / (1.0 + dist)  # convert L2 distance to similarity score
+                results.append(RetrievalResult(
+                    document=self.documents[idx],
+                    score=score
+                ))
+        return sorted(results, key=lambda r: r.score, reverse=True)
+```
+
+The score conversion `1.0 / (1.0 + dist)` transforms an L2 distance (0 = identical, ∞ = maximally different) into a bounded score (1.0 = identical, 0 = maximally different). This makes scores intuitive and comparable.
+
+### Text Chunking: The Sliding Window
+
+```python
+def chunk_text(text: str, chunk_size: int = 1000, 
+               chunk_overlap: int = 200) -> List[str]:
+    chunks = []
+    start = 0
+    text_length = len(text)
+    
+    while start < text_length:
+        end = start + chunk_size
+        chunk = text[start:end]
+        
+        if chunk.strip():  # skip whitespace-only chunks
+            chunks.append(chunk)
+        
+        # Advance by (chunk_size - chunk_overlap)
+        # So next chunk starts 200 chars before the end of this one
+        start += chunk_size - chunk_overlap
+    
+    return chunks
+```
+
+**Why overlap?** Without overlap, critical context that spans a chunk boundary is split. Consider this text at the boundary of chunk 1 and chunk 2:
+
+```
+... The main cause of this phenomenon is [boundary] carbon dioxide accumulation in the upper atmosphere ...
+```
+
+Without overlap, "this phenomenon" in chunk 1 has no referent (stored in one chunk), and "carbon dioxide" in chunk 2 has no question (stored in the next). With a 200-character overlap, both chunks contain the complete phrase around the boundary.
+
+**A concrete example** — with `chunk_size=50, chunk_overlap=10` (shortened for clarity):
+
+```
+Text: "The quick brown fox jumped over the lazy dog near the river."
+
+Chunk 1: "The quick brown fox jumped over the lazy"
+Chunk 2: "y dog near the river."
+             ↑
+         10-char overlap from chunk 1
+```
+
+### Prompt Construction and Generation
+
+```python
+def query(self, question: str, k: int = 3) -> str:
+    # Step 1: Embed the question
+    query_embedding = self.embedder.embed_text(question)
+    
+    # Step 2: Retrieve top-k similar chunks
+    results = self.vector_store.search(query_embedding, k=k)
+    
+    # Step 3: Build context string
+    context_pieces = [r.document.content for r in results]
+    context = "\n\n---\n\n".join(context_pieces)
+    
+    # Step 4: Construct the prompt
     messages = [
-        {"role": "system", "content": f"Answer using this context:\n\n{context}"},
-        {"role": "user", "content": question}
+        {
+            "role": "system",
+            "content": (
+                "You are a helpful assistant. Answer the user's question "
+                "using ONLY the information provided in the context below. "
+                "If the context does not contain enough information to answer "
+                "the question, say so clearly. Do not use knowledge outside the context.\n\n"
+                f"Context:\n{context}"
+            )
+        },
+        {
+            "role": "user",
+            "content": question
+        }
     ]
+    
     return self.llm.chat(messages)
 ```
 
-The query vector is compared against all stored chunk vectors. The top `k` (typically 3) most similar chunks are assembled into a context string and passed to the LLM.
+The system prompt instructs the model to use **only** the provided context. This is the most important prompt design decision in a RAG system — without this constraint, the LLM will blend retrieved facts with training-data knowledge, making it impossible to know which parts of the answer are grounded.
+
+The `temperature=0.0` setting on the LLM chat forces deterministic generation. For factual Q&A, you don't want creative variation — you want the same correct answer every time.
 
 ---
 
-## CSV Support
+## CSV Support: RAG Over Tabular Data
 
-Simple RAG also handles structured CSV data. Each row is converted to a key-value string representation:
+Simple RAG also handles CSV files. Each row is converted to a structured string:
 
+```python
+def index_csv(self, file_path: str) -> int:
+    df = pd.read_csv(file_path)
+    
+    # Convert each row to a key-value string
+    rows_as_text = []
+    for _, row in df.iterrows():
+        # "Column1: Value1 | Column2: Value2 | Column3: Value3"
+        row_text = " | ".join(
+            f"{col}: {val}" for col, val in row.items()
+            if pd.notna(val)  # skip empty cells
+        )
+        rows_as_text.append(row_text)
+    
+    # Concatenate and chunk (rows can be batched together)
+    full_text = "\n".join(rows_as_text)
+    return self.index_document(full_text)
 ```
-Column1: Value1 | Column2: Value2 | Column3: Value3
-```
 
-This flattened representation allows the same vector-search mechanism to work on tabular data, though more sophisticated approaches (like SQL generation) may be better for complex analytical queries.
+This flattened representation — where every column becomes a labeled key-value pair — works well for semantic search. A query "orders from customer John in March" will semantically match rows containing "Customer: John | Month: March | ...".
+
+**Important limitation**: This approach works for semantic lookup but poorly for analytical queries like "what is the total revenue by region?" Those require SQL-style aggregation, not semantic retrieval. For analytical CSV queries, consider text-to-SQL approaches instead.
+
+---
+
+## The Embedding Model: text-embedding-3-small
+
+OpenAI's `text-embedding-3-small` produces 1536-dimensional vectors and is the default for this implementation. Key properties:
+
+| Property | Value |
+|----------|-------|
+| Dimensions | 1536 |
+| Max input tokens | 8,192 |
+| Context window | ~6,000 words |
+| Cost | $0.02 per million tokens |
+| Quality | Very good for semantic search |
+
+A 1536-dimensional vector means each chunk is represented as a point in a 1536-dimensional space. Chunks about similar topics cluster near each other in this space. The astonishing power of modern embeddings is their ability to capture semantic relationships: "dog" and "canine" end up near each other; "climate change" and "global warming" cluster together even though they share no words.
+
+---
+
+## Performance Characteristics
+
+### Index Time
+For a typical 50-page PDF (~150,000 characters):
+- Number of chunks: ~150 (at 1000 char/chunk, 200 overlap)
+- Embedding API call: 1 batch call, ~2-3 seconds
+- FAISS index build: instant (flat index)
+- **Total index time**: ~3-5 seconds
+
+For a 500-page document:
+- Number of chunks: ~1,500
+- Embedding time: ~20-30 seconds (multiple batches)
+- **Total index time**: ~30-60 seconds
+
+### Query Time
+| Step | Typical Time |
+|------|-------------|
+| Embed question | 100-200ms |
+| FAISS search (1,500 vectors) | <1ms |
+| LLM generation (gpt-4o-mini) | 500-1500ms |
+| **Total** | **~700ms-2s** |
 
 ---
 
 ## Key Configuration Parameters
 
-| Parameter | Default | Purpose |
-|-----------|---------|---------|
-| `chunk_size` | 1000 | Characters per chunk |
-| `chunk_overlap` | 200 | Overlap between adjacent chunks |
-| `k` | 3 | Number of chunks to retrieve |
-| `embedding_model` | `text-embedding-3-small` | Embedding model for semantic search |
-| `chat_model` | `gpt-4o-mini` | LLM for answer generation |
-| `temperature` | 0.0 | Generation determinism (0 = fully deterministic) |
+| Parameter | Default | Effect of Increasing | Effect of Decreasing |
+|-----------|---------|---------------------|---------------------|
+| `chunk_size` | 1000 chars | More context per chunk, less precise retrieval | Fewer chars per chunk, more precise retrieval |
+| `chunk_overlap` | 200 chars | Better boundary coverage, more storage | Risk of losing boundary context |
+| `k` | 3 | More context, risk of dilution and cost | Less context, risk of missing relevant info |
+| `temperature` | 0.0 | N/A (increase → more creative, less accurate) | Already minimum |
+
+### Choosing k
+
+`k=3` is a sensible default. Here's the practical guide:
+
+- **k=1**: Use when the corpus is highly structured and one chunk will always contain the answer. Very fast, minimal noise.
+- **k=3**: Standard for most Q&A applications. Covers 1 primary source + 2 supporting/alternative chunks.
+- **k=5**: Use for complex, multi-faceted questions that may draw from multiple document sections.
+- **k=10+**: Use cautiously. Beyond a point, adding more context confuses phrasing LLMs and blows up token costs.
 
 ---
 
-## Strengths and Limitations
+## Failure Modes to Understand
 
-### Strengths
+### 1. Chunk Boundary Artifacts
 
-- **✅ Simple to implement and understand**: The pipeline has no complex dependencies.
-- **✅ Works out of the box**: For most Q&A use cases on well-structured documents, Simple RAG delivers solid results.
-- **✅ Low latency**: With FAISS, retrieval is extremely fast even at scale.
-- **✅ Cost-efficient**: Only the retrieved chunks (not the entire document) are sent to the LLM.
+When the answer straddles a chunk boundary, retrieval may return a chunk that *almost* contains the answer:
 
-### Limitations
+```
+Perfect answer: "The treaty was signed on June 28, 1919"
 
-- **❌ Fixed chunk boundaries**: Splitting by character count ignores sentence and paragraph structure. A chunk might end mid-sentence, cutting critical context.
-- **❌ No query understanding**: The raw query is embedded as-is. Ambiguous or poorly phrased questions may retrieve irrelevant chunks.
-- **❌ Context isolation**: Each chunk is retrieved independently. If the answer spans multiple conceptually related chunks that aren't near each other in the document, they may not all be retrieved.
-- **❌ No relevance filtering**: All top-k results are included in the context regardless of their actual relevance to the query. Noisy context can mislead the LLM.
+Chunk retrieved: "negotiations culminated in an agreement, formalized"
+Next chunk:      "on June 28, 1919, imposing heavy terms on..."
+```
+
+The chunk 200 characters before the date was retrieved because the query semantically matched "agreement/formalized", but the date itself is in the next chunk. Solutions: overlap, context enrichment window, or semantic chunking.
+
+### 2. Top-k Averaging Problem
+
+FAISS returns the k *most similar* chunks. But "most similar in embedding space" ≠ "most relevant to this specific question." A chunk about climate policy might score 0.82 cosine similarity to a climate mechanisms question purely because they share topic vocabulary — even though the chunk doesn't contain the answer.
+
+Solutions: contextual compression, reranking.
+
+### 3. Multi-hop Questions
+
+"Compare the revenue performance in Q3 2023 to the strategic objectives stated in the 2022 annual report" requires retrieving from two separate sections of two separate documents. Simple RAG retrieves the k most similar chunks without any multi-hop reasoning. It may get one side of the comparison but miss the other.
+
+Solutions: query decomposition, iterative retrieval, adaptive retrieval.
+
+### 4. Long Documents Without Distinct Sections
+
+For a 300-page textbook with dense, uniform writing, hundreds of chunks may be nearly equally relevant to most queries. FAISS returns the top-k but cannot distinguish truly relevant from semantically adjacent chunks.
+
+Solutions: hierarchical indices, proposition chunking.
 
 ---
 
 ## When to Use Simple RAG
 
-Simple RAG is the right choice when:
+Simple RAG is the right starting point for almost any project — it's fast to build, easy to reason about, and surprisingly effective for well-structured documents with direct questions. If your corpus has clear, self-contained sections and your users ask specific questions that map to one or two document regions, Simple RAG may be all you ever need.
 
-- You're prototyping or building a proof of concept
-- Your documents are well-structured and self-contained in each section
-- Query complexity is low (factual lookups, definitions, etc.)
-- You need a quick, reliable baseline to benchmark other techniques against
+The signal that you need to go further is usually obvious in practice: users getting vague answers, chunks returning from the wrong sections, or queries that span multiple document parts coming back incomplete. Those are the failure modes that the subsequent techniques in this collection are designed to fix.
 
 ---
 
-## What Comes Next
+## Benchmarking: Simple RAG as Your Baseline
 
-The limitations of Simple RAG motivated the entire field of advanced RAG research. Every technique in this series addresses one or more of these gaps:
+One of the most important functions of Simple RAG is serving as the **benchmark** against which every advanced technique is measured. Before adding complexity, always:
 
-- **Proposition Chunking**: Breaks text into atomic facts instead of fixed windows
-- **Semantic Chunking**: Uses embedding similarity to find natural topic boundaries
-- **Context Enrichment Window**: Expands retrieved chunks with neighboring text
-- **Reranking**: Adds a second-pass relevance filtering step
-- **CRAG / Self-RAG**: Evaluates retrieval quality before answering
+1. Implement Simple RAG
+2. Create a representative evaluation set (20-50 question/answer pairs)
+3. Measure Recall@k, Precision@k, and answer faithfulness
+4. Apply an advanced technique
+5. Measure again and compare
 
-Understanding Simple RAG deeply is essential before exploring these advanced variants — knowing what you're improving upon makes each enhancement intuitive rather than arbitrary.
+If a complex technique doesn't outperform Simple RAG on your specific dataset and query distribution, don't use it. Occam's razor applies strongly in production RAG systems: unnecessary complexity is a maintenance burden with no quality payoff.
+
+---
+
+## Comparison with Related Approaches
+
+| Approach | Knowledge Source | Update Mechanism | Private Data | Hallucination Risk |
+|----------|-----------------|-----------------|--------------|-------------------|
+| Bare LLM | Training data | Retrain (expensive) | No | High |
+| Fine-tuned LLM | Training + fine-tune data | Fine-tune (medium cost) | Yes, but baked in | Medium |
+| **RAG** | **Live document store** | **Add/update documents** | **Yes, dynamic** | **Low** |
+| Parametric only | Training data | None | No | High |
+
+RAG's key advantage over fine-tuning is **dynamism**: the knowledge base can be updated, expanded, or corrected without touching the model.
 
 ---
 
 ## Summary
 
-Simple RAG is where every RAG journey begins. It establishes the three-phase pattern — **index → retrieve → generate** — that all advanced techniques build upon. Its elegance lies in its simplicity: a semantic search engine paired with a language model, each doing what it does best.
+Simple RAG establishes the three-phase pattern — **index → retrieve → generate** — that all advanced RAG techniques build upon. It is simultaneously a useful tool in its own right and the conceptual foundation without which no advanced technique can be understood.
 
-Master this foundation, and every advanced RAG technique becomes an incremental improvement rather than a black box.
+Understanding Simple RAG at a deep level means understanding:
+- How embeddings represent semantic meaning numerically
+- How FAISS finds nearest neighbors in high-dimensional space
+- How chunking affects retrieval granularity
+- How prompt design controls answer grounding
+- How each parameter affects the cost/quality/latency triangle
+
+Every advanced RAG technique you learn from this point is an incremental improvement to one or more of these fundamentals. Master this foundation, and every subsequent technique becomes intuitive rather than mysterious.
